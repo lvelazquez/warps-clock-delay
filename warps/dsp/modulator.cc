@@ -533,13 +533,93 @@ void Modulator::ProcessDelay(ShortFrame* input, ShortFrame* output, size_t size)
   filter_[0].set_f<stmlib::FREQUENCY_FAST>(0.0008f);
   filter_[1].set_f<stmlib::FREQUENCY_FAST>(0.0008f);
 
+  // Clocked delay (button state 0): input 2 is a clock, the Algorithm knob
+  // selects a ratio of the measured clock period.
+  static const float kClockRatios[] = {
+    1.0f / 4.0f, 1.0f / 3.0f, 1.0f / 2.0f, 2.0f / 3.0f, 3.0f / 4.0f,
+    1.0f, 1.5f, 2.0f, 3.0f, 4.0f
+  };
+  static const int kNumClockRatios = 10;
+  static const uint32_t kClockMinGap = 192;          // 2 ms: ignore bounces
+  static const uint32_t kClockMaxPeriod = 4 * 96000; // 4 s: below 15 BPM = lost
+  static float clock_period = 48000.0f;              // samples; 120 BPM default
+  static uint32_t clock_counter = 0;
+  static bool clock_high = false;
+  static bool clock_synced = false;
+  static int ratio_index = 5;
+  const bool clocked = parameters_.carrier_shape == 0;
+
+  // Timbre as a bipolar tone control on the repeats: CCW low-pass, noon
+  // flat, CW high-pass. Cutoffs are normalized (cycles per sample at 96 kHz).
+  bool tone_active = false;
+  bool tone_highpass = false;
+  if (clocked) {
+    float tone = parameters_.modulation_parameter * 2.0f - 1.0f;  // -1..1
+    float amount = fabsf(tone);
+    if (amount > 0.04f) {
+      tone_active = true;
+      tone_highpass = tone > 0.0f;
+      float f = tone_highpass
+          ? 0.0005f * powf(2.0f, amount * 8.0f)    // 48 Hz .. 12 kHz
+          : 0.2f * powf(2.0f, -amount * 7.0f);     // 19 kHz .. 150 Hz
+      filter_[2].set_f<stmlib::FREQUENCY_FAST>(f);
+      filter_[3].set_f<stmlib::FREQUENCY_FAST>(f);
+    }
+  }
+
+  if (clocked) {
+    // Quantize the Algorithm knob to a ratio, with hysteresis so the knob
+    // does not chatter on step boundaries.
+    float pos = parameters_.raw_algorithm * kNumClockRatios;
+    if (pos > ratio_index + 1.1f || pos < ratio_index - 0.1f) {
+      int idx = static_cast<int>(pos);
+      if (idx < 0) idx = 0;
+      if (idx > kNumClockRatios - 1) idx = kNumClockRatios - 1;
+      ratio_index = idx;
+    }
+  }
+
   while (size--) {
 
+    float clock_time = 0.0f;
+    float clock_rate = 1.0f;
+    if (clocked) {
+      if (clock_counter <= kClockMaxPeriod) {
+        ++clock_counter;
+      } else {
+        clock_synced = false;  // clock lost: hold last period
+      }
+      float c = static_cast<float>(input->r) / 32768.0f;
+      if (!clock_high && c > 0.1f) {
+        clock_high = true;
+        if (clock_counter >= kClockMinGap) {
+          if (clock_synced && clock_counter <= kClockMaxPeriod) {
+            float measured = static_cast<float>(clock_counter);
+            // Smooth jitter, but follow real tempo changes immediately.
+            clock_period = fabsf(measured - clock_period) < 0.05f * clock_period
+                ? clock_period + 0.5f * (measured - clock_period)
+                : measured;
+          }
+          clock_synced = true;
+          clock_counter = 0;
+        }
+      } else if (clock_high && c < 0.04f) {
+        clock_high = false;
+      }
+
+      // Delay time in input samples. If it does not fit the buffer, lower
+      // the write sample rate so the same number of frames spans it.
+      float t = clock_period * kClockRatios[ratio_index];
+      float cap = static_cast<float>(DELAY_SIZE - 16);
+      clock_rate = t > cap ? cap / t : 1.0f;
+      clock_time = t * clock_rate;
+    }
+
     static float lp_time = 0.0f;
-    ONE_POLE(lp_time, time, 0.00002f);
+    ONE_POLE(lp_time, clocked ? clock_time : time, 0.00002f);
 
     static float lp_rate;
-    ONE_POLE(lp_rate, rate, 0.007f);
+    ONE_POLE(lp_rate, clocked ? clock_rate : rate, 0.007f);
     float sample_rate = fabsf(lp_rate);
     CONSTRAIN(sample_rate, 0.001f, 1.0f);
     int direction = lp_rate > 0.0f ? 1 : -1;
@@ -573,9 +653,18 @@ void Modulator::ProcessDelay(ShortFrame* input, ShortFrame* output, size_t size)
       fb.l = SoftLimit(fb.l * 1.4f + 0.1f) / 1.4f - SoftLimit(0.1f);
       fb.r = SoftLimit(fb.r * 1.4f + 0.1f) / 1.4f - SoftLimit(0.1f);
     } else if (parameters_.carrier_shape == 0) {
-      // open feedback loop
-      fb.l = feedback * 1.1f * in.r;
-      fb.r = feedback_sample.l;
+      // clocked ping-pong delay: input 2 is the clock, not audio. The tone
+      // filter runs on the feedback path, so each repeat is filtered again.
+      float tl = feedback_sample.l;
+      float tr = feedback_sample.r;
+      if (tone_active) {
+        float lp_l = filter_[2].Process<stmlib::FILTER_MODE_LOW_PASS>(tl);
+        float lp_r = filter_[3].Process<stmlib::FILTER_MODE_LOW_PASS>(tr);
+        tl = tone_highpass ? tl - lp_l : lp_l;
+        tr = tone_highpass ? tr - lp_r : lp_r;
+      }
+      fb.l = tr * feedback * 1.1f;
+      fb.r = tl * feedback * 1.1f;
       in.r = 0.0f;
     } else {
       // classic dual delay
@@ -690,11 +779,9 @@ void Modulator::ProcessDelay(ShortFrame* input, ShortFrame* output, size_t size)
     float fade_out = Interpolate(lut_xfade_out, drywet, 256.0f);
 
     if (parameters_.carrier_shape == 0) {
-      // if open feedback loop, AUX is the wet signal and OUT
-      // crossfades between inputs
-      in.r = static_cast<float>(input->r) / 32768.0f;
-      output->l = Clip16((fade_out * in.l + fade_in * in.r) * 32768.0f);
-      output->r = Clip16(wet.r * 32768.0f);
+      // clocked delay: mono dry (input 1) against the ping-pong wet pair
+      output->l = Clip16((fade_out * in.l + fade_in * wet.l) * 32768.0f);
+      output->r = Clip16((fade_out * in.l + fade_in * wet.r) * 32768.0f);
     } else if (parameters_.carrier_shape == 2) {
       // analog mode -> soft-clipping
       output->l = SoftConvert((fade_out * in.l + fade_in * wet.l) * 2.0f);
