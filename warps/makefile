@@ -51,6 +51,16 @@ TOOLCHAIN_PATH ?= ${MI_TOOLCHAIN_PATH}
 
 include stmlib/makefile.inc
 
+# Linker script with the unwind tables discarded, for current Arm GNU
+# toolchains (the stmlib one overlaps .data when newlib brings them in).
+LINKER_SCRIPT  = warps/linker/stm32f4xx_flash_application_large.ld
+
+# The code base is from 2014: current compilers default to a newer C++
+# standard (no 'register' keyword) and warn about constructs in the vendor
+# headers, which stmlib turns into errors.
+CPPFLAGS      += -std=gnu++11
+CCFLAGS       += -Wno-error
+
 # Rule for building the firmware update file
 wav:  $(TARGET_BIN)
 	python stm_audio_bootloader/qpsk/encoder.py \
