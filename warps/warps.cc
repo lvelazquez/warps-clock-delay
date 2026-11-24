@@ -48,7 +48,12 @@ const float kSampleRate = 96000.0f;
 
 uint16_t reverb_buffer[32768] __attribute__ ((section (".ccmdata")));
 
-int __errno;
+// Modern newlib (Arm GNU Toolchain 13+) calls __errno() as a function from
+// libm's error paths (expf, powf); the 2014-era toolchain used a variable.
+extern "C" int* __errno(void) {
+  static int errno_value;
+  return &errno_value;
+}
 
 // Default interrupt handlers.
 extern "C" {
